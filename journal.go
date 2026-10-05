@@ -17,6 +17,8 @@ import (
 //
 // kind 1 payload = JSON encoding of Message
 // kind 2 payload = JSON encoding of cursorRecord
+// kind 3 payload = JSON encoding of pendingRecord (held out-of-order message)
+// kind 4 payload = JSON encoding of gapSettleRecord (gap settlement verdict)
 //
 // A journal surviving a process restart lets the router rebuild per-key
 // sequence state and replay unacknowledged messages to durable subscribers,
@@ -36,6 +38,8 @@ const (
 
 	journalKindMessage byte = 1
 	journalKindCursor  byte = 2
+	journalKindPending byte = 3
+	journalKindSettle  byte = 4
 )
 
 // ErrJournalCorrupt means a frame could not be fully read/decoded.
@@ -129,6 +133,44 @@ func (j *Journal) AppendCursor(subID, topic, key string, seq uint64) error {
 	return j.appendRecord(journalKindCursor, payload)
 }
 
+// pendingRecord is the JSON payload of a pending (held out-of-order) message
+// frame. Since carries the gap-open timestamp so the wait budget survives a
+// restart instead of silently resetting.
+type pendingRecord struct {
+	Msg   Message `json:"msg"`
+	Since int64   `json:"since"` // UnixNano of gap-open time
+}
+
+// AppendPending durably records that msg is held by the out-of-order window.
+func (j *Journal) AppendPending(m *Message, sinceNano int64) error {
+	payload, err := json.Marshal(pendingRecord{Msg: *m, Since: sinceNano})
+	if err != nil {
+		return fmt.Errorf("encode journal pending: %w", err)
+	}
+	return j.appendRecord(journalKindPending, payload)
+}
+
+// gapSettleRecord is the JSON payload of a gap settlement verdict: seqs up to
+// and including LostUpTo were ruled unrecoverable for (topic, key).
+type gapSettleRecord struct {
+	Topic    string `json:"topic"`
+	Key      string `json:"key"`
+	LostUpTo uint64 `json:"lost_up_to"`
+	Cause    string `json:"cause"`  // "capacity" | "timeout"
+	Action   string `json:"action"` // "skip" | "terminate"
+}
+
+// AppendGapSettlement durably records a gap settlement verdict.
+func (j *Journal) AppendGapSettlement(topic, key string, lostUpTo uint64, cause, action string) error {
+	payload, err := json.Marshal(gapSettleRecord{
+		Topic: topic, Key: key, LostUpTo: lostUpTo, Cause: cause, Action: action,
+	})
+	if err != nil {
+		return fmt.Errorf("encode journal gap settlement: %w", err)
+	}
+	return j.appendRecord(journalKindSettle, payload)
+}
+
 // journalEntry is one decoded record in replay order.
 type journalEntry struct {
 	kind  byte
@@ -137,6 +179,13 @@ type journalEntry struct {
 	topic string
 	key   string
 	seq   uint64
+
+	// kind 3 (pending): gap-open timestamp of the held message (UnixNano).
+	pendingSince int64
+	// kind 4 (gap settlement): verdict fields.
+	lostUpTo uint64
+	cause    string
+	action   string
 }
 
 // Replay visits records from the beginning in append order. A corrupt frame
@@ -192,6 +241,20 @@ func (j *Journal) Replay(visit func(journalEntry) error) error {
 				return fmt.Errorf("%w: bad cursor json: %v", ErrJournalCorrupt, err)
 			}
 			e.kind, e.subID, e.topic, e.key, e.seq = kind, c.SubscriberID, c.Topic, c.Key, c.Seq
+		case journalKindPending:
+			var p pendingRecord
+			if err := json.Unmarshal(payload, &p); err != nil {
+				return fmt.Errorf("%w: bad pending json: %v", ErrJournalCorrupt, err)
+			}
+			m := p.Msg
+			e.kind, e.msg, e.pendingSince = kind, &m, p.Since
+		case journalKindSettle:
+			var g gapSettleRecord
+			if err := json.Unmarshal(payload, &g); err != nil {
+				return fmt.Errorf("%w: bad gap settlement json: %v", ErrJournalCorrupt, err)
+			}
+			e.kind, e.topic, e.key, e.lostUpTo, e.cause, e.action =
+				kind, g.Topic, g.Key, g.LostUpTo, g.Cause, g.Action
 		default:
 			return fmt.Errorf("%w: unknown record kind %d", ErrJournalCorrupt, kind)
 		}

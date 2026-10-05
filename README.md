@@ -49,6 +49,7 @@
 | `router_rejected` | 帧合法但被路由层拒绝，详情见 `Router.Reason` |
 
 路由层 `router.RejectReason`：`duplicate`、`seq_rollback`、`seq_gap`、
+`gap_pending`（乱序窗口挂起，非错误）、`stream_terminated`、
 `unsupported_version`、`missing_id`、`missing_topic`、`zero_seq`、`router_closed`。
 
 ---
@@ -82,6 +83,37 @@
 
 缺口不会推进前沿：拒绝 `seq=5` 后，`seq=3` 仍可正常接受（当期望为 3 时）。
 
+### 有界乱序补齐（可选，按分区键开启）
+
+默认（`Config.OutOfOrder == nil`）行为与上表完全一致：任何跳号立即以 `seq_gap`
+拒绝。为指定的键配置窗口后（`OutOfOrderConfig.Match(topic, key)` 返回 true），
+跳号消息不再立刻判掉，而是进入**有界挂起窗口**：
+
+- `seq > nextSeq` 且窗口未满 → 挂起（`PublishResult.Pending=true`，
+  `Reason=gap_pending`），等缺的序号补上来后按原顺序一起放行；
+- 缺口补齐（`seq == nextSeq` 到达）→ 先接受该消息，再按序释放所有可衔接的
+  挂起消息，投递顺序严格按序号；
+- 挂起是**有界**的，两个边界都可配：
+  - `Capacity`：每键最多挂起多少条。再到来一条乱序消息会超出容量时，立即结算
+    当前缺口（`cause=capacity`）；
+  - `MaxWait`：一个缺口最多等多久。后台清扫协程（`SweepInterval`，默认为
+    `MaxWait/4` 且不小于 10ms）发现超时即结算（`cause=timeout`）；
+- 结算给出**明确且彼此可区分**的结论：缺口区间 `[nextSeq..lostUpTo]` 被判定为
+  再也补不上（计入 `seqs_declared_lost`，这些序号之后再到达会被判
+  `seq_rollback`），随后按 `OnSettle` 行动：
+  - `GapActionSkip`（默认）：前沿跳过缺口，挂起消息按序放行，流继续；
+  - `GapActionTerminate`：挂起消息逐条丢弃（逐条计数、逐条日志），该键的流
+    终结，之后任何非重复消息都被判 `stream_terminated`；
+- 容量结算不会把**触发它的那条消息**本身判丢：丢失区间上界取
+  `min(挂起最小序号, 到达序号) - 1`；
+- 挂起消息参与去重：同 ID 再发判 `duplicate`，同序号不同 ID 判 `duplicate`
+  （不挤掉已挂起消息），绝不静默替换；
+- 释放与结算都走与发布相同的 non-blocking fan-out：慢订阅者同样**不会**反过来
+  卡住发布方、清扫协程或其他订阅者；
+- 该判定在路由层统一做出，与消息从 native 还是 jsonline 传输进来无关。
+
+未匹配 `Match` 的键行为与旧版**完全一致**（立即 `seq_gap`）。
+
 ---
 
 ## 3. 背压策略
@@ -104,9 +136,17 @@
 可选追加式日志 `router.Journal`（长度前缀二进制帧，魔数 `PJ`，默认每帧 `fsync`，
 `WithoutFsync()` 可关闭）：
 
-- 接受消息先写日志再 fan-out；记录类型为「消息」与「游标」；
+- 接受消息先写日志再 fan-out；记录类型为「消息」「游标」「挂起」「缺口结算」；
 - **重启时重放**：重建每个分区键的序号前沿与最近 ID 表，因此重启后
   `duplicate`/`seq_rollback`/`seq_gap` 判定依然成立，且后续消息按原顺序衔接，不乱序；
+- **乱序窗口的恢复**：挂起消息连同其缺口开启时间一起落盘（等待预算不因重启
+  而重置或丢失），结算结论（丢失区间、原因、动作）同样落盘——重启前挂起的消息
+  不会被当成从没发生过，已放行的消息不会重复投递，被判丢的序号重启后仍然判丢，
+  被终结的流重启后仍然终结；崩溃时若放行记录未写完，恢复阶段会按日志把可衔接的
+  挂起消息补放行（先补写日志再推进状态）；
+- **不静默降级**：日志里存在挂起记录但当前配置没有为该键开启乱序窗口时，`New`
+  直接报错；挂起记录与已接受前沿对不上（缺少对应的接受记录）时也报错，而不是
+  静默丢弃状态；
 - **持久订阅者**（`WithDurable("稳定ID")`）的游标按「订阅者 × 分区键」记录；重启后
   用同一 ID 重新订阅，会把未确认（`seq > ackSeq`）的保留消息按序回放，语义为
   **at-least-once**：崩溃只会导致重放，不会丢失；消费方应以消息 `id` 做业务幂等。
@@ -134,7 +174,18 @@
 `published / accepted / rejected / duplicates / seq_rollbacks / seq_gaps /
 delivered / dropped_backpressure / subscribers_live / replayed`
 
+乱序窗口新增的计数（彼此可区分）：
+
+`gap_pending`（累计挂起）/ `pending_now`（当前挂起，gauge）/
+`pending_released`（缺口补齐后按序放行）/ `gap_settled_capacity`（容量到顶结算）/
+`gap_settled_timeout`（等待超时结算）/ `seqs_declared_lost`（被判丢的序号总数）/
+`stream_terminated`（终结流上的拒绝数）/ `terminated_keys`（被终结的键数）/
+`terminated_pending_drops`（终结时丢弃的挂起消息数）
+
 配置 `Config.Logger` 后，每次判定都打印一行，包含 **主题、序号、消息 ID 与判定依据**。
+乱序窗口相关的日志行：`PENDING`（挂起，含窗口占用与等待预算）、`RELEASED`
+（按序放行）、`GAP_SETTLED`（结算，含丢失区间、cause、action）、
+`PENDING_DROPPED`（终结丢弃）。
 
 ---
 
@@ -152,10 +203,10 @@ go build ./...
 go vet ./...
 # 普通单测
 go test ./...
-# 竞态检测 + 重复执行（并发发布/重复消费/畸形报文/慢订阅者/重启回放均覆盖）
+# 竞态检测 + 重复执行（并发发布/重复消费/畸形报文/慢订阅者/重启回放/乱序窗口均覆盖）
 go test -race -count=3 ./...
 # 查看含主题、序号与判定依据的单测日志
-go test -v -run 'Duplicate|Backpressure|Concurrent|Malformed|Replay' ./...
+go test -v -run 'Duplicate|Backpressure|Concurrent|Malformed|Replay|OutOfOrder' ./...
 ```
 
 测试覆盖：
@@ -169,7 +220,20 @@ go test -v -run 'Duplicate|Backpressure|Concurrent|Malformed|Replay' ./...
 - `TestMalformedFramesDistinguishable` / `TestJSONLineStreamMixed`：坏 JSON、坏版本、
   缺字段、坏 base64、crc 损坏、超长帧各有独立 code；
 - `TestJournalRestartFrontierAndNoLoss` / `TestDurableSubscriberReplayAfterRestart` /
-  `TestJournalCorruptionReportedNotSkipped`：重启恢复、游标回放、损坏报错。
+  `TestJournalCorruptionReportedNotSkipped`：重启恢复、游标回放、损坏报错；
+- `TestOutOfOrderGapFilledLater`：缺口后来补齐，挂起消息按原序放行；
+- `TestOutOfOrderDisabledKeyUnchanged`：未开窗的键行为与旧版完全一致；
+- `TestOutOfOrderCapacitySettlementSkip` / `TestOutOfOrderTimeoutSettlementSkip`：
+  容量到顶 / 等待超时两种结算，判丢序号、按序放行、结论计数可区分；
+- `TestOutOfOrderTerminate`：终结动作逐条丢弃挂起消息，后续发布判
+  `stream_terminated`；
+- `TestOutOfOrderConcurrentPublishers`：多发布者乱序到达，投递严格 1..N 不丢不重；
+- `TestOutOfOrderRestartRecovery` / `TestOutOfOrderRestartAfterSettlement` /
+  `TestOutOfOrderTerminateRestart`：带挂起 / 带结算 / 带终结的重启恢复；
+- `TestOutOfOrderPendingRequiresWindowAfterRestart`：有挂起记录但未开窗时启动
+  明确报错，不静默降级；
+- `TestOutOfOrderConsistentAcrossTransports`（transport 包）：同一结论与消息来自
+  哪条本地传输无关。
 
 ## 8. 快速上手
 

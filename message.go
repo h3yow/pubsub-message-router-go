@@ -62,6 +62,14 @@ const (
 	RejectRollback  RejectReason = "seq_rollback"
 	RejectGap       RejectReason = "seq_gap"
 
+	// RejectGapPending is not an error: the out-of-order window is enabled
+	// for the key and the message is held until the gap resolves. See
+	// PublishResult.Pending.
+	RejectGapPending RejectReason = "gap_pending"
+	// RejectStreamTerminated means the key's stream was terminated by a gap
+	// settlement (GapActionTerminate); no further messages are accepted.
+	RejectStreamTerminated RejectReason = "stream_terminated"
+
 	// Lifecycle.
 	RejectRouterClosed RejectReason = "router_closed"
 )
@@ -121,7 +129,11 @@ func (m *Message) Validate() error {
 //
 //	an error condition requiring retry, a rollback/gap is.
 type PublishResult struct {
-	Accepted  bool
+	Accepted bool
+	// Pending is true when the message was neither accepted nor rejected but
+	// held by the out-of-order window (Reason == RejectGapPending). Its final
+	// disposition is later observable via logs and counters.
+	Pending   bool
 	Reason    RejectReason
 	Detail    string
 	Message   *Message
@@ -134,6 +146,9 @@ func (r PublishResult) String() string {
 		m := r.Message
 		return fmt.Sprintf("ACCEPTED topic=%s key=%s seq=%d id=%s delivered=%d dropped=%d",
 			m.Topic, m.Key, m.Seq, m.ID, r.Delivered, r.Dropped)
+	}
+	if r.Pending {
+		return fmt.Sprintf("PENDING reason=%s detail=%s", r.Reason, r.Detail)
 	}
 	return fmt.Sprintf("REJECTED reason=%s detail=%s", r.Reason, r.Detail)
 }

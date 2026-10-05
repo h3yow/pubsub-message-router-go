@@ -17,6 +17,17 @@ type Counters struct {
 	droppedBackpressure atomic.Int64
 	subscribersLive     atomic.Int64
 	replayed            atomic.Int64
+
+	// Out-of-order window dispositions.
+	gapPending          atomic.Int64 // total messages held by the window
+	pendingNow          atomic.Int64 // currently held (gauge)
+	pendingReleased     atomic.Int64 // held messages later released in order
+	gapSettledCapacity  atomic.Int64 // gaps settled because capacity ran out
+	gapSettledTimeout   atomic.Int64 // gaps settled because the wait budget ran out
+	seqsDeclaredLost    atomic.Int64 // seq numbers ruled unrecoverable
+	streamTerminated    atomic.Int64 // publishes rejected on a terminated stream
+	terminatedKeys      atomic.Int64 // keys whose stream was terminated
+	terminatedPendDrops atomic.Int64 // held messages dropped on termination
 }
 
 // Stats is a point-in-time immutable snapshot of Counters.
@@ -31,6 +42,16 @@ type Stats struct {
 	DroppedBackpressure int64 `json:"dropped_backpressure"`
 	SubscribersLive     int64 `json:"subscribers_live"`
 	Replayed            int64 `json:"replayed"`
+
+	GapPending             int64 `json:"gap_pending"`
+	PendingNow             int64 `json:"pending_now"`
+	PendingReleased        int64 `json:"pending_released"`
+	GapSettledCapacity     int64 `json:"gap_settled_capacity"`
+	GapSettledTimeout      int64 `json:"gap_settled_timeout"`
+	SeqsDeclaredLost       int64 `json:"seqs_declared_lost"`
+	StreamTerminated       int64 `json:"stream_terminated"`
+	TerminatedKeys         int64 `json:"terminated_keys"`
+	TerminatedPendingDrops int64 `json:"terminated_pending_drops"`
 }
 
 func (c *Counters) snapshot() Stats {
@@ -45,5 +66,15 @@ func (c *Counters) snapshot() Stats {
 		DroppedBackpressure: c.droppedBackpressure.Load(),
 		SubscribersLive:     c.subscribersLive.Load(),
 		Replayed:            c.replayed.Load(),
+
+		GapPending:             c.gapPending.Load(),
+		PendingNow:             c.pendingNow.Load(),
+		PendingReleased:        c.pendingReleased.Load(),
+		GapSettledCapacity:     c.gapSettledCapacity.Load(),
+		GapSettledTimeout:      c.gapSettledTimeout.Load(),
+		SeqsDeclaredLost:       c.seqsDeclaredLost.Load(),
+		StreamTerminated:       c.streamTerminated.Load(),
+		TerminatedKeys:         c.terminatedKeys.Load(),
+		TerminatedPendingDrops: c.terminatedPendDrops.Load(),
 	}
 }

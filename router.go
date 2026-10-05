@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // defaultShardCount shards per-key ordering state to reduce lock contention
@@ -25,6 +26,10 @@ type Config struct {
 	// RetainPerKey bounds how many accepted messages are kept per partition
 	// key for replay to late/recovering durable subscribers. 0 = unlimited.
 	RetainPerKey int
+	// OutOfOrder enables the bounded out-of-order recovery window for the
+	// partition keys it matches. nil keeps the legacy behavior: any
+	// discontinuity is rejected immediately with seq_gap.
+	OutOfOrder *OutOfOrderConfig
 }
 
 // Logger is the minimal logging surface used by the router.
@@ -37,6 +42,7 @@ type Router struct {
 	journal *Journal
 	logger  Logger
 	retain  int
+	ooo     *OutOfOrderConfig
 
 	shards []*keyShard
 	subMu  sync.RWMutex
@@ -73,12 +79,36 @@ type keyState struct {
 	order []uint64
 	// retained are accepted messages kept for durable-subscriber replay.
 	retained []*Message
+
+	// ---- out-of-order window (only when enabled for this key) ----
+	// ooo is the resolved per-key config; nil = window disabled.
+	ooo *OutOfOrderConfig
+	// pending holds out-of-order messages by Seq until the gap resolves.
+	pending map[uint64]*pendingEntry
+	// pendingIDs maps held message ID -> Seq for duplicate detection.
+	pendingIDs map[string]uint64
+	// gapSince is when the current gap episode opened (wait budget start).
+	gapSince time.Time
+	// terminated is set when a gap settlement terminated the stream.
+	terminated bool
 }
 
 const dedupWindow = 4096
 
 func newKeyState() *keyState {
 	return &keyState{nextSeq: 1, recent: make(map[string]uint64)}
+}
+
+// keyStateLocked returns the state for k, creating it (and resolving whether
+// the out-of-order window applies) on first use. Caller holds the shard lock.
+func (r *Router) keyStateLocked(sh *keyShard, k topicKey) *keyState {
+	st, ok := sh.state[k]
+	if !ok {
+		st = newKeyState()
+		st.ooo = r.resolveOOO(k)
+		sh.state[k] = st
+	}
+	return st
 }
 
 // New constructs a router and replays the journal when one is configured.
@@ -89,11 +119,17 @@ func New(cfg Config) (*Router, error) {
 	if n <= 0 {
 		n = defaultShardCount
 	}
+	if cfg.OutOfOrder != nil {
+		if err := cfg.OutOfOrder.validate(); err != nil {
+			return nil, err
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Router{
 		journal: cfg.Journal,
 		logger:  cfg.Logger,
 		retain:  cfg.RetainPerKey,
+		ooo:     cfg.OutOfOrder,
 		shards:  make([]*keyShard, n),
 		subs:    make(map[string]*subscriber),
 		ctx:     ctx,
@@ -107,6 +143,13 @@ func New(cfg Config) (*Router, error) {
 			cancel()
 			return nil, err
 		}
+	}
+	if r.ooo != nil {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			r.sweepLoop(r.ooo.sweepInterval())
+		}()
 	}
 	return r, nil
 }
@@ -249,13 +292,19 @@ type PublishOption func(*publishOptions)
 // Per partition key the Seq frontier is checked under a shard lock:
 //   - ID already seen (or Seq == last with a *different* id) -> duplicate,
 //     explicitly reported, never redelivered;
-//   - Seq < expected frontier                          -> seq_rollback;
-//   - Seq > expected frontier                          -> seq_gap
+//   - stream terminated by a gap settlement     -> stream_terminated;
+//   - Seq < expected frontier                     -> seq_rollback;
+//   - Seq > expected frontier, window disabled  -> seq_gap
 //     (discontinuous sequence, rejected rather than silently buffered);
-//   - Seq == expected frontier and ID new               -> accepted.
+//   - Seq > expected frontier, window enabled   -> gap_pending: held
+//     (bounded by Capacity/MaxWait) until the gap resolves; the final
+//     disposition is observable via logs and counters;
+//   - Seq == expected frontier and ID new       -> accepted.
 //
 // Accepted messages are journaled before fan-out, then offered to each
-// matching subscriber via non-blocking bounded buffers.
+// matching subscriber via non-blocking bounded buffers. When an accept (or
+// a gap settlement) makes held messages reachable, they are released in
+// order right after it, so per-key delivery order is always by Seq.
 func (r *Router) Publish(ctx context.Context, msg *Message, _ ...PublishOption) PublishResult {
 	r.counters.published.Add(1)
 	r.closeMu.Lock()
@@ -273,45 +322,55 @@ func (r *Router) Publish(ctx context.Context, msg *Message, _ ...PublishOption) 
 	shard := r.shardFor(k)
 
 	shard.mu.Lock()
-	st, ok := shard.state[k]
-	if !ok {
-		st = newKeyState()
-		shard.state[k] = st
-	}
+	st := r.keyStateLocked(shard, k)
 	var res PublishResult
+	var released []*Message
+	var jerr error
 	switch {
 	case st.recent[msg.ID] != 0:
 		res = r.reject(msg, RejectDuplicate,
 			fmt.Sprintf("topic=%s key=%s seq=%d id=%s: message id already consumed at seq=%d; not redelivered",
 				msg.Topic, msg.Key, msg.Seq, msg.ID, st.recent[msg.ID]), st)
+	case st.ooo != nil && st.pendingIDs[msg.ID] != 0:
+		res = r.reject(msg, RejectDuplicate,
+			fmt.Sprintf("topic=%s key=%s seq=%d id=%s: message id already held at seq=%d; not redelivered",
+				msg.Topic, msg.Key, msg.Seq, msg.ID, st.pendingIDs[msg.ID]), st)
+	case st.terminated:
+		res = r.reject(msg, RejectStreamTerminated,
+			fmt.Sprintf("topic=%s key=%s seq=%d id=%s: stream terminated by gap settlement; not delivered",
+				msg.Topic, msg.Key, msg.Seq, msg.ID), st)
 	case msg.Seq < st.nextSeq:
 		// Old position with an unseen id: sequence number regression.
 		res = r.reject(msg, RejectRollback,
 			fmt.Sprintf("topic=%s key=%s seq=%d id=%s: seq behind expected=%d; rejected, not delivered",
 				msg.Topic, msg.Key, msg.Seq, msg.ID, st.nextSeq), st)
-	case msg.Seq > st.nextSeq:
+	case msg.Seq > st.nextSeq && st.ooo == nil:
 		res = r.reject(msg, RejectGap,
 			fmt.Sprintf("topic=%s key=%s seq=%d id=%s: discontinuity, expected=%d; reject rather than silently skip",
 				msg.Topic, msg.Key, msg.Seq, msg.ID, st.nextSeq), st)
+	case msg.Seq > st.nextSeq:
+		// Out-of-order window enabled: hold (possibly settling a full
+		// window first) instead of rejecting the discontinuity.
+		res, released, jerr = r.pendLocked(st, k, msg)
 	default:
 		// New, in-order message: commit durable state under the shard lock
 		// so concurrent publishers on the same key are serialized.
-		if r.journal != nil {
-			if err := r.journal.AppendMessage(msg); err != nil {
-				shard.mu.Unlock()
-				res = PublishResult{Accepted: false, Reason: "journal_error", Detail: err.Error(), Message: msg}
-				r.logf("REJECTED topic=%s seq=%d id=%s reason=journal_error detail=%v", msg.Topic, msg.Seq, msg.ID, err)
-				r.counters.rejected.Add(1)
-				return res
-			}
-		}
-		st.advance(msg)
-		r.retainLocked(st, msg)
-		res = PublishResult{Accepted: true, Message: msg}
+		res, released, jerr = r.acceptLocked(st, k, msg)
 	}
 	shard.mu.Unlock()
 
+	if jerr != nil {
+		res = PublishResult{Accepted: false, Reason: "journal_error", Detail: jerr.Error(), Message: msg}
+		r.logf("REJECTED topic=%s seq=%d id=%s reason=journal_error detail=%v", msg.Topic, msg.Seq, msg.ID, jerr)
+		r.counters.rejected.Add(1)
+		return res
+	}
 	if !res.Accepted {
+		// A pend may have settled a full window and released held messages
+		// even though the triggering message itself was held/rejected.
+		for _, m := range released {
+			r.fanout(m)
+		}
 		return res
 	}
 
@@ -320,18 +379,29 @@ func (r *Router) Publish(ctx context.Context, msg *Message, _ ...PublishOption) 
 		msg.Topic, k.key, msg.Seq, msg.ID, msg.Seq)
 
 	// Fan-out: non-blocking per subscriber. A slow subscriber can never
-	// block the publisher or any other subscriber.
+	// block the publisher or any other subscriber. Held messages released
+	// by this accept are fanned out after it, preserving per-key order.
+	res.Delivered, res.Dropped = r.fanout(msg)
+	for _, m := range released {
+		r.fanout(m)
+	}
+	return res
+}
+
+// fanout offers msg to every matching subscriber without blocking. It
+// returns how many subscribers accepted vs dropped the offer.
+func (r *Router) fanout(msg *Message) (delivered, dropped int) {
 	for _, s := range r.matchingSubscribers(msg.Topic) {
 		if s.offer(msg) {
-			res.Delivered++
+			delivered++
 		} else {
-			res.Dropped++
+			dropped++
 			r.counters.droppedBackpressure.Add(1)
 			r.logf("BACKPRESSURE topic=%s seq=%d id=%s subscriber=%s policy=%s",
 				msg.Topic, msg.Seq, msg.ID, s.id, s.policy)
 		}
 	}
-	return res
+	return delivered, dropped
 }
 
 func (st *keyState) advance(msg *Message) {
@@ -368,6 +438,8 @@ func (r *Router) reject(msg *Message, reason RejectReason, detail string, st *ke
 		r.counters.seqRollbacks.Add(1)
 	case RejectGap:
 		r.counters.seqGaps.Add(1)
+	case RejectStreamTerminated:
+		r.counters.streamTerminated.Add(1)
 	}
 	if reason != RejectRouterClosed {
 		r.counters.rejected.Add(1)
@@ -430,7 +502,10 @@ func (r *Router) advanceCursor(subID string, k topicKey, seq uint64) error {
 
 // recoverFromJournal replays the log at startup: accepted messages rebuild
 // key frontier and retained history; cursor records (last one wins per
-// subscriber) set the replay starting point.
+// subscriber) set the replay starting point; pending records rebuild the
+// held out-of-order window (with their original wait budget); gap settlement
+// records re-apply lost-seq verdicts and stream terminations. Anything that
+// cannot be safely reconciled is an explicit error, never a silent downgrade.
 func (r *Router) recoverFromJournal() error {
 	cursors := make(map[string]map[topicKey]uint64)
 	err := r.journal.Replay(func(e journalEntry) error {
@@ -450,15 +525,28 @@ func (r *Router) recoverFromJournal() error {
 			k := m.partitionKey()
 			sh := r.shardFor(k)
 			sh.mu.Lock()
-			st, ok := sh.state[k]
-			if !ok {
-				st = newKeyState()
-				sh.state[k] = st
-			}
+			st := r.keyStateLocked(sh, k)
 			st.advance(m)
 			r.retainLocked(st, m)
+			// An accept record may release a message whose pending record
+			// was replayed earlier; the hold is superseded.
+			if st.pending != nil {
+				if pe, ok := st.pending[m.Seq]; ok {
+					delete(st.pending, m.Seq)
+					delete(st.pendingIDs, pe.msg.ID)
+					r.counters.pendingNow.Add(-1)
+				}
+			}
 			sh.mu.Unlock()
 			r.counters.replayed.Add(1)
+		case journalKindPending:
+			if err := r.recoverPending(e); err != nil {
+				return err
+			}
+		case journalKindSettle:
+			if err := r.recoverSettlement(e); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -466,8 +554,108 @@ func (r *Router) recoverFromJournal() error {
 		return err
 	}
 	r.recoveredCursors = cursors
-	r.logf("RECOVERY messages=%d durable_subscribers=%d",
-		r.counters.replayed.Load(), len(cursors))
+	if err := r.drainRecoveredPending(); err != nil {
+		return err
+	}
+	r.logf("RECOVERY messages=%d durable_subscribers=%d pending=%d",
+		r.counters.replayed.Load(), len(cursors), r.counters.pendingNow.Load())
+	return nil
+}
+
+// recoverPending re-holds one out-of-order message from its journal record.
+func (r *Router) recoverPending(e journalEntry) error {
+	m := e.msg
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("journal holds invalid pending message: %w", err)
+	}
+	k := m.partitionKey()
+	sh := r.shardFor(k)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := r.keyStateLocked(sh, k)
+	switch {
+	case st.terminated:
+		// A terminate settlement dropped this held message before the
+		// restart; the drop is already final, nothing to rebuild.
+		return nil
+	case m.Seq < st.nextSeq:
+		// The message must have been released before the crash; verify the
+		// accept record exists instead of silently dropping the record.
+		if st.recent[m.ID] != m.Seq {
+			return fmt.Errorf("journal inconsistent: pending topic=%s key=%s seq=%d id=%s below frontier=%d without accept record",
+				k.topic, k.key, m.Seq, m.ID, st.nextSeq)
+		}
+		return nil
+	case st.ooo == nil:
+		return fmt.Errorf("journal holds pending topic=%s key=%s seq=%d id=%s but the out-of-order window is not enabled for this key; refusing to silently change semantics",
+			k.topic, k.key, m.Seq, m.ID)
+	}
+	if st.pending == nil {
+		st.pending = make(map[uint64]*pendingEntry)
+		st.pendingIDs = make(map[string]uint64)
+	}
+	since := time.Unix(0, e.pendingSince)
+	st.pending[m.Seq] = &pendingEntry{msg: m, since: since}
+	st.pendingIDs[m.ID] = m.Seq
+	if st.gapSince.IsZero() || since.Before(st.gapSince) {
+		st.gapSince = since
+	}
+	r.counters.gapPending.Add(1)
+	r.counters.pendingNow.Add(1)
+	return nil
+}
+
+// recoverSettlement re-applies one gap settlement verdict.
+func (r *Router) recoverSettlement(e journalEntry) error {
+	if e.cause != string(gapCauseCapacity) && e.cause != string(gapCauseTimeout) {
+		return fmt.Errorf("journal holds gap settlement with unknown cause %q", e.cause)
+	}
+	if e.action != GapActionSkip.String() && e.action != GapActionTerminate.String() {
+		return fmt.Errorf("journal holds gap settlement with unknown action %q", e.action)
+	}
+	k := topicKey{topic: e.topic, key: e.key}
+	sh := r.shardFor(k)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := r.keyStateLocked(sh, k)
+	if e.lostUpTo >= st.nextSeq {
+		st.nextSeq = e.lostUpTo + 1
+	}
+	if e.action == GapActionTerminate.String() {
+		st.terminated = true
+		st.pending = nil
+		st.pendingIDs = nil
+		st.gapSince = time.Time{}
+		return nil
+	}
+	// skip: held entries at or below the lost range are gone for good.
+	for seq, pe := range st.pending {
+		if seq <= e.lostUpTo {
+			delete(st.pending, seq)
+			delete(st.pendingIDs, pe.msg.ID)
+		}
+	}
+	return nil
+}
+
+// drainRecoveredPending releases held messages that became reachable before
+// the crash but whose release was not journaled (crash mid-drain). Each
+// release is journaled now, so the post-recovery state is exactly the state
+// a no-crash run would have persisted.
+func (r *Router) drainRecoveredPending() error {
+	for _, sh := range r.shards {
+		sh.mu.Lock()
+		for k, st := range sh.state {
+			if len(st.pending) == 0 || st.terminated {
+				continue
+			}
+			if _, err := r.drainPendingLocked(st, k); err != nil {
+				sh.mu.Unlock()
+				return fmt.Errorf("drain recovered pending: %w", err)
+			}
+		}
+		sh.mu.Unlock()
+	}
 	return nil
 }
 
