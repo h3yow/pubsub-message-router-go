@@ -62,6 +62,20 @@ const (
 	RejectRollback  RejectReason = "seq_rollback"
 	RejectGap       RejectReason = "seq_gap"
 
+	// Bounded reorder dispositions.
+	// RejectHeld: the message is parked behind an open gap (not yet a final
+	// conclusion; it may be released in order or reported lost later).
+	RejectHeld RejectReason = "seq_held"
+	// RejectHeldConflict: the seq is already occupied in the hold window by a
+	// different message id (producer contradiction, never overwritten).
+	RejectHeldConflict RejectReason = "seq_held_conflict"
+	// RejectGapLost: this seq was declared permanently unfillable after the
+	// capacity or wait bound elapsed.
+	RejectGapLost RejectReason = "seq_gap_lost"
+	// RejectStreamTerminated: the partition stream failed closed after an
+	// unfillable gap settled with GapTerminate.
+	RejectStreamTerminated RejectReason = "stream_terminated"
+
 	// Lifecycle.
 	RejectRouterClosed RejectReason = "router_closed"
 )
@@ -127,6 +141,9 @@ type PublishResult struct {
 	Message   *Message
 	Delivered int
 	Dropped   int
+	// Held is true when the message was accepted into the bounded reorder
+	// window but is parked behind an open gap (not delivered yet).
+	Held bool
 }
 
 func (r PublishResult) String() string {

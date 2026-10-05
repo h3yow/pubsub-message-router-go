@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // defaultShardCount shards per-key ordering state to reduce lock contention
@@ -25,6 +26,13 @@ type Config struct {
 	// RetainPerKey bounds how many accepted messages are kept per partition
 	// key for replay to late/recovering durable subscribers. 0 = unlimited.
 	RetainPerKey int
+	// Reorder, when non-nil, enables bounded out-of-order buffering per
+	// partition key for the keys it returns a policy for. Keys without a
+	// policy keep the strict-contiguous semantics unchanged.
+	Reorder ReorderSelector
+	// OnGapEvent receives one event per gap conclusion (fill / capacity /
+	// timeout). May be nil.
+	OnGapEvent GapCallback
 }
 
 // Logger is the minimal logging surface used by the router.
@@ -37,6 +45,8 @@ type Router struct {
 	journal *Journal
 	logger  Logger
 	retain  int
+	reorder ReorderSelector
+	onGap   GapCallback
 
 	shards []*keyShard
 	subMu  sync.RWMutex
@@ -64,6 +74,9 @@ type keyShard struct {
 
 // keyState is the per (topic,key) stream state.
 type keyState struct {
+	// tk identifies the partition; needed because states are recovered from
+	// the journal before any publish touches the key.
+	tk topicKey
 	// nextSeq is the expected Seq of the next new message.
 	nextSeq uint64
 	// recent maps message ID -> Seq for bounded duplicate detection beyond
@@ -73,12 +86,27 @@ type keyState struct {
 	order []uint64
 	// retained are accepted messages kept for durable-subscriber replay.
 	retained []*Message
+
+	// ---- bounded reorder (only used when a policy applies to this key) ----
+
+	// policy is non-nil when reorder buffering is enabled for the key.
+	policy *ReorderPolicy
+	// policyChecked caches that the selector was consulted for this state.
+	policyChecked bool
+	// held parks out-of-order messages keyed by seq while a gap is open.
+	held map[uint64]*heldEntry
+	// gapDeadline is oldest heldAt + MaxWait while a gap is open.
+	gapDeadline time.Time
+	// timer fires the wait-bound settlement; nil when no gap is open.
+	timer *time.Timer
+	// terminated means the stream failed closed after an unfillable gap.
+	terminated bool
 }
 
 const dedupWindow = 4096
 
-func newKeyState() *keyState {
-	return &keyState{nextSeq: 1, recent: make(map[string]uint64)}
+func newKeyState(tk topicKey) *keyState {
+	return &keyState{tk: tk, nextSeq: 1, recent: make(map[string]uint64)}
 }
 
 // New constructs a router and replays the journal when one is configured.
@@ -94,6 +122,8 @@ func New(cfg Config) (*Router, error) {
 		journal: cfg.Journal,
 		logger:  cfg.Logger,
 		retain:  cfg.RetainPerKey,
+		reorder: cfg.Reorder,
+		onGap:   cfg.OnGapEvent,
 		shards:  make([]*keyShard, n),
 		subs:    make(map[string]*subscriber),
 		ctx:     ctx,
@@ -275,9 +305,31 @@ func (r *Router) Publish(ctx context.Context, msg *Message, _ ...PublishOption) 
 	shard.mu.Lock()
 	st, ok := shard.state[k]
 	if !ok {
-		st = newKeyState()
+		st = newKeyState(k)
 		shard.state[k] = st
 	}
+
+	// Keys with a reorder policy: out-of-order messages are parked within
+	// bounded capacity/wait instead of being rejected immediately. Keys
+	// without a policy take the historical strict-contiguous path unchanged.
+	if p, enabled := r.reorderPolicyFor(st); enabled {
+		res, batch := r.publishReorderLocked(st, p, msg)
+		// Fan-out remains under the shard lock so decision order equals
+		// delivery order per key; offers are non-blocking, so a slow
+		// subscriber still cannot block the publisher or anyone else.
+		for _, m := range batch {
+			var target *PublishResult
+			if m == msg {
+				target = &res
+			}
+			// Every batch member other than the triggering message was parked;
+			// the triggering message itself is a fresh in-order acceptance.
+			r.deliverLocked(target, m, m != msg)
+		}
+		shard.mu.Unlock()
+		return res
+	}
+
 	var res PublishResult
 	switch {
 	case st.recent[msg.ID] != 0:
@@ -308,30 +360,36 @@ func (r *Router) Publish(ctx context.Context, msg *Message, _ ...PublishOption) 
 		st.advance(msg)
 		r.retainLocked(st, msg)
 		res = PublishResult{Accepted: true, Message: msg}
+		r.deliverLocked(&res, msg, false)
 	}
 	shard.mu.Unlock()
 
-	if !res.Accepted {
-		return res
-	}
-
-	r.counters.accepted.Add(1)
-	r.logf("ACCEPTED topic=%s key=%s seq=%d id=%s basis=(seq==expected %d, id unseen)",
-		msg.Topic, k.key, msg.Seq, msg.ID, msg.Seq)
-
-	// Fan-out: non-blocking per subscriber. A slow subscriber can never
-	// block the publisher or any other subscriber.
-	for _, s := range r.matchingSubscribers(msg.Topic) {
-		if s.offer(msg) {
-			res.Delivered++
-		} else {
-			res.Dropped++
-			r.counters.droppedBackpressure.Add(1)
-			r.logf("BACKPRESSURE topic=%s seq=%d id=%s subscriber=%s policy=%s",
-				msg.Topic, msg.Seq, msg.ID, s.id, s.policy)
-		}
-	}
 	return res
+}
+
+// reorderReject records a reorder-specific rejection conclusion. Each reason
+// has its own counter; stream_terminated is a lifecycle verdict and not added
+// to the aggregate rejected count.
+func (r *Router) reorderReject(msg *Message, reason RejectReason, detail string) PublishResult {
+	switch reason {
+	case RejectDuplicate:
+		r.counters.duplicates.Add(1)
+		r.counters.rejected.Add(1)
+	case RejectRollback:
+		r.counters.seqRollbacks.Add(1)
+		r.counters.rejected.Add(1)
+	case RejectHeldConflict:
+		r.counters.heldConflicts.Add(1)
+		r.counters.rejected.Add(1)
+	case RejectGapLost:
+		r.counters.gapLostRejects.Add(1)
+		r.counters.rejected.Add(1)
+	case RejectStreamTerminated:
+		r.counters.streamRejects.Add(1)
+	}
+	r.logf("REJECTED topic=%s key=%s seq=%d id=%s reason=%s detail=%s",
+		safeTopic(msg), safeKey(msg), safeSeq(msg), safeID(msg), reason, detail)
+	return PublishResult{Accepted: false, Reason: reason, Detail: detail, Message: msg}
 }
 
 func (st *keyState) advance(msg *Message) {
@@ -429,7 +487,9 @@ func (r *Router) advanceCursor(subID string, k topicKey, seq uint64) error {
 }
 
 // recoverFromJournal replays the log at startup: accepted messages rebuild
-// key frontier and retained history; cursor records (last one wins per
+// key frontier and retained history; hold records restore messages still
+// parked behind an open gap; gap records restore unfillable-gap conclusions
+// (frontier jumps / terminated streams); cursor records (last one wins per
 // subscriber) set the replay starting point.
 func (r *Router) recoverFromJournal() error {
 	cursors := make(map[string]map[topicKey]uint64)
@@ -443,31 +503,203 @@ func (r *Router) recoverFromJournal() error {
 			}
 			cm[topicKey{topic: e.topic, key: e.key}] = e.seq
 		case journalKindMessage:
-			m := e.msg
-			if err := m.Validate(); err != nil {
-				return fmt.Errorf("journal holds invalid message: %w", err)
+			if err := r.recoverMessageLocked(e.msg); err != nil {
+				return err
 			}
-			k := m.partitionKey()
-			sh := r.shardFor(k)
-			sh.mu.Lock()
-			st, ok := sh.state[k]
-			if !ok {
-				st = newKeyState()
-				sh.state[k] = st
-			}
-			st.advance(m)
-			r.retainLocked(st, m)
-			sh.mu.Unlock()
 			r.counters.replayed.Add(1)
+		case journalKindHold:
+			if err := r.recoverHoldLocked(e); err != nil {
+				return err
+			}
+			r.counters.replayed.Add(1)
+		case journalKindGap:
+			if err := r.recoverGapLocked(e.gap); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	if err := r.restoreReorder(); err != nil {
+		return err
+	}
 	r.recoveredCursors = cursors
 	r.logf("RECOVERY messages=%d durable_subscribers=%d",
 		r.counters.replayed.Load(), len(cursors))
+	return nil
+}
+
+// stateForLocked returns the key state for m, creating it if needed. Caller
+// does not need to hold any lock yet (the shard lock is taken internally).
+func (r *Router) stateForLocked(k topicKey) (*keyShard, *keyState) {
+	sh := r.shardFor(k)
+	sh.mu.Lock()
+	st, ok := sh.state[k]
+	if !ok {
+		st = newKeyState(k)
+		sh.state[k] = st
+	}
+	return sh, st
+}
+
+// recoverMessageLocked replays one committed (kind 1) message. A kind-1 seq
+// must be exactly the next contiguous seq; a kind-1 for a still-parked seq
+// would mean a hold frame was never settled — an incomplete/unsafe state.
+func (r *Router) recoverMessageLocked(m *Message) error {
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("journal holds invalid message: %w", err)
+	}
+	k := m.partitionKey()
+	sh, st := r.stateForLocked(k)
+	defer sh.mu.Unlock()
+	if st.terminated {
+		return fmt.Errorf("%w: committed message topic=%s key=%s seq=%d after terminated stream",
+			ErrJournalCorrupt, k.topic, k.key, m.Seq)
+	}
+	if _, parked := st.held[m.Seq]; parked {
+		return fmt.Errorf("%w: committed topic=%s key=%s seq=%d duplicates a still-held record",
+			ErrJournalCorrupt, k.topic, k.key, m.Seq)
+	}
+	if m.Seq != st.nextSeq {
+		return fmt.Errorf("%w: committed topic=%s key=%s seq=%d out of order, expected=%d",
+			ErrJournalCorrupt, k.topic, k.key, m.Seq, st.nextSeq)
+	}
+	st.advance(m)
+	r.retainLocked(st, m)
+	// A committed message may release a contiguous run of parked messages.
+	if len(st.held) > 0 {
+		released := r.drainLocked(st, m.Seq+1)
+		if len(released) > 0 {
+			st.nextSeq = released[len(released)-1].Seq + 1
+		}
+		if len(st.held) == 0 {
+			r.stopGapTimerLocked(st)
+		}
+	}
+	return nil
+}
+
+// recoverHoldLocked restores one still-parked message (kind 4).
+func (r *Router) recoverHoldLocked(e journalEntry) error {
+	m := e.msg
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("journal holds invalid held message: %w", err)
+	}
+	k := m.partitionKey()
+	if e.topic != k.topic || e.key != k.key || e.heldAt.IsZero() {
+		return fmt.Errorf("%w: hold record partition/held_at mismatch for topic=%s seq=%d",
+			ErrJournalCorrupt, k.topic, m.Seq)
+	}
+	sh, st := r.stateForLocked(k)
+	defer sh.mu.Unlock()
+	if st.terminated {
+		return fmt.Errorf("%w: held record topic=%s key=%s seq=%d after terminated stream",
+			ErrJournalCorrupt, k.topic, k.key, m.Seq)
+	}
+	if m.Seq <= st.nextSeq {
+		return fmt.Errorf("%w: held topic=%s key=%s seq=%d must be above frontier=%d",
+			ErrJournalCorrupt, k.topic, k.key, m.Seq, st.nextSeq)
+	}
+	if _, dup := st.held[m.Seq]; dup {
+		return fmt.Errorf("%w: duplicate held record topic=%s key=%s seq=%d",
+			ErrJournalCorrupt, k.topic, k.key, m.Seq)
+	}
+	if st.held == nil {
+		st.held = make(map[uint64]*heldEntry)
+	}
+	st.held[m.Seq] = &heldEntry{msg: m, heldAt: e.heldAt}
+	st.recent[m.ID] = m.Seq
+	st.order = append(st.order, m.Seq)
+	r.counters.heldNow.Add(1)
+	return nil
+}
+
+// recoverGapLocked restores one gap conclusion (kind 3) and verifies it
+// against the rebuilt hold set: the journal must be internally consistent.
+func (r *Router) recoverGapLocked(g *gapRecord) error {
+	k := topicKey{topic: g.Topic, key: g.Key}
+	sh, st := r.stateForLocked(k)
+	defer sh.mu.Unlock()
+
+	basis := GapBasis(g.Basis)
+	action := GapAction(g.Action)
+	if basis != GapCapacity && basis != GapTimeout {
+		return fmt.Errorf("%w: gap record topic=%s key=%s has bad basis=%q",
+			ErrJournalCorrupt, g.Topic, g.Key, g.Basis)
+	}
+	if action != GapContinue && action != GapTerminate {
+		return fmt.Errorf("%w: gap record topic=%s key=%s has bad action=%d",
+			ErrJournalCorrupt, g.Topic, g.Key, g.Action)
+	}
+
+	// Missing seqs must be the contiguous prefix [nextSeq, minHeld).
+	high := st.nextSeq + uint64(len(g.Missing))
+	for i, s := range g.Missing {
+		if s != st.nextSeq+uint64(i) {
+			return fmt.Errorf("%w: gap record topic=%s key=%s missing not contiguous: %v",
+				ErrJournalCorrupt, g.Topic, g.Key, g.Missing)
+		}
+	}
+	if len(st.held) > 0 && high != minHeldSeq(st.held) {
+		return fmt.Errorf("%w: gap record topic=%s key=%s missing end=%d != first held=%d",
+			ErrJournalCorrupt, g.Topic, g.Key, high, minHeldSeq(st.held))
+	}
+
+	switch action {
+	case GapTerminate:
+		if len(g.Ended) != len(st.held) {
+			return fmt.Errorf("%w: terminate gap record topic=%s key=%s ended=%d held=%d",
+				ErrJournalCorrupt, g.Topic, g.Key, len(g.Ended), len(st.held))
+		}
+		for _, s := range g.Ended {
+			h, ok := st.held[s]
+			if !ok {
+				return fmt.Errorf("%w: terminate gap record references unheld seq=%d",
+					ErrJournalCorrupt, s)
+			}
+			r.noteLostSeqLocked(st, h.msg.Seq)
+		}
+		st.held = nil
+		st.terminated = true
+		st.nextSeq = g.NextSeq
+	case GapContinue:
+		if len(g.Released) == 0 || g.Released[0] != high {
+			return fmt.Errorf("%w: continue gap record topic=%s key=%s released must start at %d",
+				ErrJournalCorrupt, g.Topic, g.Key, high)
+		}
+		for i, s := range g.Released {
+			if i > 0 && s != g.Released[i-1]+1 {
+				return fmt.Errorf("%w: continue gap record released not contiguous: %v",
+					ErrJournalCorrupt, g.Released)
+			}
+			if _, ok := st.held[s]; !ok {
+				return fmt.Errorf("%w: continue gap record references unheld seq=%d",
+					ErrJournalCorrupt, s)
+			}
+		}
+		lastReleased := g.Released[len(g.Released)-1]
+		if g.NextSeq != lastReleased+1 {
+			return fmt.Errorf("%w: continue gap record nextSeq=%d must follow last released=%d",
+				ErrJournalCorrupt, g.NextSeq, lastReleased)
+		}
+		// The recorded frontier must land on a still-missing seq (or on the
+		// first still-parked seq of a deeper gap); it must not silently skip
+		// past messages still present in the hold set.
+		if _, parked := st.held[g.NextSeq]; parked {
+			return fmt.Errorf("%w: continue gap record nextSeq=%d collides with held message",
+				ErrJournalCorrupt, g.NextSeq)
+		}
+		// Apply the same jump+release as a live Continue settlement: release
+		// the contiguous parked run above the lost prefix, then advance.
+		released := r.drainLocked(st, high)
+		st.nextSeq = g.NextSeq
+		if uint64(len(released)) != uint64(len(g.Released)) {
+			return fmt.Errorf("%w: continue gap record released=%d drained=%d",
+				ErrJournalCorrupt, len(g.Released), len(released))
+		}
+	}
 	return nil
 }
 
@@ -522,6 +754,7 @@ func (r *Router) Close() error {
 	r.closed = true
 	r.closeMu.Unlock()
 
+	r.stopAllGapTimers()
 	r.cancel()
 	r.subMu.Lock()
 	subs := make([]*subscriber, 0, len(r.subs))

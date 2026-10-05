@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // Journal is an append-only durable log of accepted messages and subscriber
@@ -36,6 +37,16 @@ const (
 
 	journalKindMessage byte = 1
 	journalKindCursor  byte = 2
+	// journalKindGap durably records one gap conclusion (fill / capacity /
+	// timeout): which seqs were lost, which parked seqs were released and the
+	// resulting frontier. Recovery uses it to restore termination/frontier
+	// state and to verify held-message consistency.
+	journalKindGap byte = 3
+	// journalKindHold records one message parked behind an open gap, together
+	// with the time it was parked (used to restore the wait deadline). A
+	// parked message lives exactly once as a hold record until a gap record
+	// releases/ends it; seeing a kind-1 message for a parked seq is an error.
+	journalKindHold byte = 4
 )
 
 // ErrJournalCorrupt means a frame could not be fully read/decoded.
@@ -129,14 +140,60 @@ func (j *Journal) AppendCursor(subID, topic, key string, seq uint64) error {
 	return j.appendRecord(journalKindCursor, payload)
 }
 
+// gapRecord is the JSON payload of a gap-settlement frame.
+type gapRecord struct {
+	Topic    string   `json:"topic"`
+	Key      string   `json:"key"`
+	Basis    string   `json:"basis"`
+	Action   int      `json:"action"`
+	Missing  []uint64 `json:"missing,omitempty"`
+	Released []uint64 `json:"released,omitempty"`
+	Ended    []uint64 `json:"ended,omitempty"`
+	NextSeq  uint64   `json:"next_seq"`
+}
+
+// AppendGapEvent durably persists one gap conclusion.
+func (j *Journal) AppendGapEvent(rec gapRecord) error {
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("encode journal gap event: %w", err)
+	}
+	return j.appendRecord(journalKindGap, payload)
+}
+
+// holdRecord is the JSON payload of a parked-message frame. HeldAt is the
+// original park time so recovery restores the same wait deadline instead of
+// silently extending the wait after restart.
+type holdRecord struct {
+	Topic  string          `json:"topic"`
+	Key    string          `json:"key"`
+	HeldAt time.Time       `json:"held_at"`
+	Msg    json.RawMessage `json:"msg"`
+}
+
+// AppendHold durably persists one message parked behind an open gap.
+func (j *Journal) AppendHold(topic, key string, heldAt time.Time, m *Message) error {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("encode journal hold message: %w", err)
+	}
+	payload, err := json.Marshal(holdRecord{Topic: topic, Key: key, HeldAt: heldAt, Msg: raw})
+	if err != nil {
+		return fmt.Errorf("encode journal hold: %w", err)
+	}
+	return j.appendRecord(journalKindHold, payload)
+}
+
 // journalEntry is one decoded record in replay order.
 type journalEntry struct {
-	kind  byte
-	msg   *Message
-	subID string
-	topic string
-	key   string
-	seq   uint64
+	kind   byte
+	msg    *Message
+	subID  string
+	topic  string
+	key    string
+	seq    uint64
+	gap    *gapRecord
+	heldAt time.Time
 }
 
 // Replay visits records from the beginning in append order. A corrupt frame
@@ -192,6 +249,22 @@ func (j *Journal) Replay(visit func(journalEntry) error) error {
 				return fmt.Errorf("%w: bad cursor json: %v", ErrJournalCorrupt, err)
 			}
 			e.kind, e.subID, e.topic, e.key, e.seq = kind, c.SubscriberID, c.Topic, c.Key, c.Seq
+		case journalKindGap:
+			var g gapRecord
+			if err := json.Unmarshal(payload, &g); err != nil {
+				return fmt.Errorf("%w: bad gap json: %v", ErrJournalCorrupt, err)
+			}
+			e.kind, e.gap = kind, &g
+		case journalKindHold:
+			var h holdRecord
+			if err := json.Unmarshal(payload, &h); err != nil {
+				return fmt.Errorf("%w: bad hold json: %v", ErrJournalCorrupt, err)
+			}
+			var m Message
+			if err := json.Unmarshal(h.Msg, &m); err != nil {
+				return fmt.Errorf("%w: bad held message json: %v", ErrJournalCorrupt, err)
+			}
+			e.kind, e.msg, e.topic, e.key, e.heldAt = kind, &m, h.Topic, h.Key, h.HeldAt
 		default:
 			return fmt.Errorf("%w: unknown record kind %d", ErrJournalCorrupt, kind)
 		}

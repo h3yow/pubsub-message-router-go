@@ -49,7 +49,9 @@
 | `router_rejected` | 帧合法但被路由层拒绝，详情见 `Router.Reason` |
 
 路由层 `router.RejectReason`：`duplicate`、`seq_rollback`、`seq_gap`、
-`unsupported_version`、`missing_id`、`missing_topic`、`zero_seq`、`router_closed`。
+`unsupported_version`、`missing_id`、`missing_topic`、`zero_seq`、`router_closed`；
+开启乱序补齐后另有 `seq_held`、`seq_held_conflict`、`seq_gap_lost`、`stream_terminated`
+（见 2.5 节）。
 
 ---
 
@@ -84,6 +86,102 @@
 
 ---
 
+## 2.5 有界乱序补齐（按分区键显式开启）
+
+### 解决什么问题
+
+严格连续判定下，一小段消息迟到（例如 `1` 已到、`4/5` 先到、`2/3` 还在路上）会让缺口
+之后的消息**立刻**被判 `seq_gap`，业务侧只能自己在外面缓存 + 重试。开启「有界乱序补齐」
+后，这类消息会在一个**有明确容量与等待上限**的窗口内先挂起（hold），等缺的序号补齐后
+**按原顺序一起放行**；窗口到达边界则给出明确结算结论，绝不悄悄跳过、悄悄丢，也不会打乱
+已经投递出去的顺序。
+
+### 默认行为不变
+
+- 能力**默认关闭**。通过 `Config.Reorder` 提供一个按 `(topic,key)` 决策的选择器，只有
+  选择器返回 policy 的键才启用；未开启的键走与过去**完全一致**的严格连续路径。
+- 结论与消息从哪条本地传输进来无关：native 直调与 JSON-line 流进同一条管线，判定一致
+  （有测试对两种传输跑同一序列并逐条比对结论）。
+
+```go
+r, _ := router.New(router.Config{
+    Reorder: func(topic, key string) (router.ReorderPolicy, bool) {
+        if key != "need-reorder" {
+            return router.ReorderPolicy{}, false // 该键保持历史语义
+        }
+        return router.ReorderPolicy{
+            MaxHeld:      64,                  // 最多挂起 64 条乱序消息
+            MaxWait:      2 * time.Second,     // 相对最早挂起消息最多等 2s
+            OnUnfillable: router.GapContinue,  // 缺口补不上时：跳过缺口继续
+        }, true
+    },
+    OnGapEvent: func(e router.GapEvent) { /* 可观测回调 */ },
+})
+```
+
+### 两个边界怎么算
+
+- **容量 `MaxHeld`**：一个缺口（或连续多个缺口）后**当前挂起的乱序消息条数**上限。当第
+  `MaxHeld+1` 条乱序消息到达、窗口已满时，立即对「期望序号 … 已挂起的最小序号」之间连续
+  缺失的前缀做结算，然后再处理新来的消息。
+- **等待 `MaxWait`**：从**当前挂起集合里最早一条的挂起时刻**起算（不是每条各自计时）。
+  部分补齐后仍有更深缺口时，剩余消息按它们各自的原始挂起时刻重新计算截止时间。重启会用
+  日志里记录的**原始挂起时刻**恢复截止时间，不会因为重启而把等待时间顺延。
+
+### 结算结论（明确、彼此可区分）
+
+窗口到边界时，对连续缺失前缀给出可区分结论，并由 `OnUnfillable` 决定后续：
+
+| 依据 `GapBasis` | 含义 |
+|---|---|
+| `filled` | 缺口在边界内补齐，挂起消息按原序号升序放行（严格递增、不丢不重） |
+| `capacity` | 挂起容量到顶，缺失前缀被判定为永久补不上 |
+| `timeout` | 等待上限到点，缺失前缀被判定为永久补不上 |
+
+`OnUnfillable` 两种动作：
+
+- **`GapContinue`**：报告缺失序号后，挂起消息按序放行，流从新的连续前沿继续；
+- **`GapTerminate`**：报告缺失序号，挂起消息全部随缺口终结，分区流 **fail-closed**——
+  之后该键的发布一律得到 `stream_terminated`，不会在一个残缺前缀上假装续上顺序。
+
+新的路由层判定码：`seq_held`（已挂起，尚非终局）、`seq_held_conflict`（同序号已被另一条
+消息占用，保留先到者不覆盖）、`seq_gap_lost`（该序号已被判定永久补不上）、
+`stream_terminated`（分区流已终结）。挂起期间重发同一 ID 仍判 `duplicate`。挂起消息返回
+`PublishResult.Held=true`（已进入有界窗口、尚未投递），传输层 `IngestResult` 透传该结论。
+
+### 可观测的计数与日志
+
+`Snapshot()` 新增：`reorder_held_now`（当前挂起条数）、`reorder_held_total`（累计挂起）、
+`reorder_released`（挂起后按序放行）、`reorder_gaps_filled`、
+`reorder_gaps_lost_capacity`、`reorder_gaps_lost_timeout`（三种结论分列计数）、
+`reorder_streams_ended`（terminate 结算次数）、`reorder_missing_seqs`（被判永久缺失的序号
+总数）、`reorder_stream_rejects`（终结后被拒次数）、`reorder_held_conflicts`、
+`reorder_gap_lost_rejects`。
+
+日志逐行可查：`HELD`（含期望序号、占用 n/MaxHeld、截止时间）、`RELEASED`（按序放行）、
+`GAP_SETTLED`（含 `basis`、`missing`、`released`、`ended`、实际等待时长），均带主题与序号。
+`Config.OnGapEvent` 给出结构化 `GapEvent`（回调在分片锁内执行，**不要**在其中调用
+Publish/Subscribe/Close）。
+
+慢订阅者语义不变：放行仍走 non-blocking 有界缓冲，批量放行也不会让慢订阅者卡住发布方或
+其他订阅者，溢出照旧计数。
+
+### 重启恢复（开启能力的键）
+
+配置了 `Journal` 时，挂起的消息以独立的 hold 记录持久化（含原始挂起时刻），缺口结算以
+gap 记录持久化：
+
+- 重启前挂起未补齐的消息在恢复后**仍是挂起态**，不会被当成新消息，也不会重复投递已放行
+  过的消息；补缺口后仍按原顺序衔接；
+- 已 `terminate` 的流，重启后**仍然终结**；
+- 恢复会校验日志与挂起集合的一致性（缺帧/截断/序号对不上/结算记录矛盾），任何不完整、
+  无法安全恢复的状态都返回 `ErrJournalCorrupt`，**报错启动失败，绝不静默降级成另一种语义**；
+- 若日志里存在乱序状态，但当前 `Reorder` 选择器已不再为该键开启窗口，同样显式报错。
+
+不配置 `Journal` 时为纯内存路由，重启保证不适用（与既有语义一致）。
+
+---
+
 ## 3. 背压策略
 
 - 每个订阅者拥有独立的**有界缓冲**（`WithBufferSize`，默认 16）和独立投递协程；
@@ -104,7 +202,8 @@
 可选追加式日志 `router.Journal`（长度前缀二进制帧，魔数 `PJ`，默认每帧 `fsync`，
 `WithoutFsync()` 可关闭）：
 
-- 接受消息先写日志再 fan-out；记录类型为「消息」与「游标」；
+- 接受消息先写日志再 fan-out；记录类型为「消息」「游标」「挂起消息（hold）」与「缺口结算
+  （gap）」；
 - **重启时重放**：重建每个分区键的序号前沿与最近 ID 表，因此重启后
   `duplicate`/`seq_rollback`/`seq_gap` 判定依然成立，且后续消息按原顺序衔接，不乱序；
 - **持久订阅者**（`WithDurable("稳定ID")`）的游标按「订阅者 × 分区键」记录；重启后
@@ -134,6 +233,11 @@
 `published / accepted / rejected / duplicates / seq_rollbacks / seq_gaps /
 delivered / dropped_backpressure / subscribers_live / replayed`
 
+乱序补齐开启时另有 `reorder_held_now / reorder_held_total / reorder_released /
+reorder_gaps_filled / reorder_gaps_lost_capacity / reorder_gaps_lost_timeout /
+reorder_streams_ended / reorder_missing_seqs / reorder_stream_rejects /
+reorder_held_conflicts / reorder_gap_lost_rejects`（三种结算结论分别计数）。
+
 配置 `Config.Logger` 后，每次判定都打印一行，包含 **主题、序号、消息 ID 与判定依据**。
 
 ---
@@ -152,13 +256,32 @@ go build ./...
 go vet ./...
 # 普通单测
 go test ./...
-# 竞态检测 + 重复执行（并发发布/重复消费/畸形报文/慢订阅者/重启回放均覆盖）
+# 竞态检测 + 重复执行（并发发布/重复消费/畸形报文/慢订阅者/重启回放/乱序补齐均覆盖）
 go test -race -count=3 ./...
 # 查看含主题、序号与判定依据的单测日志
-go test -v -run 'Duplicate|Backpressure|Concurrent|Malformed|Replay' ./...
+go test -v -run 'Duplicate|Backpressure|Concurrent|Malformed|Replay|Reorder' ./...
 ```
 
-测试覆盖：
+乱序补齐的针对性用例（`reorder_test.go`，均断言投递序号严格递增、不丢不重，且各结算结论
+可区分）：
+
+- `TestReorderGapFillsInOrder`：缺口在窗口内补齐，挂起消息按 1..N 原序放行，filled 结论
+  与计数正确；
+- `TestReorderParkedDuplicateAndConflict`：挂起期间重发判 `duplicate`，他人占用同序号判
+  `seq_held_conflict`；
+- `TestReorderCapacitySettlesContinue`：补不上 + 容量到顶，缺失前缀明确报失、后续按序继续；
+- `TestReorderTimeoutSettlesTerminate`：等待超时 + terminate，缺失与终结消息分列、流终结后
+  一律 `stream_terminated`；
+- `TestReorderConcurrentPublishers`：8 发布者 × 150 序号并发同一键，最终恰为 1..150 各一次；
+- `TestReorderDisabledKeyUnchanged`：未开启的键维持立即 `seq_gap` 的历史语义；
+- `TestReorderRestartHeldThenFills` / `TestReorderRestartTerminatedStaysTerminated` /
+  `TestReorderRestartPolicyRemovedFails` / `TestReorderJournalCorruptionStillFatal`：重启后
+  挂起消息可接续、终结态保持、策略缺失/日志损坏明确报错；
+- `TestReorderSlowSubscriberNeverBlocks`：批量放行下慢订阅者不阻塞发布方；
+- transport 包 `TestReorderVerdictSameAcrossTransports`：native 与 jsonline 对同一乱序序列
+  的判定逐条一致。
+
+其余测试覆盖：
 
 - `TestConcurrentPublishSameKeyNoLossNoDup`：8 发布者 × 200 序号并发，接受集合恰为
   1..200 各一次（竞态检测）；

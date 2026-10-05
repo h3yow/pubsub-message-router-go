@@ -17,6 +17,19 @@ type Counters struct {
 	droppedBackpressure atomic.Int64
 	subscribersLive     atomic.Int64
 	replayed            atomic.Int64
+
+	// Bounded reorder dispositions.
+	heldNow          atomic.Int64
+	heldTotal        atomic.Int64
+	releasedFromHold atomic.Int64
+	gapsFilled       atomic.Int64
+	gapsLostCapacity atomic.Int64
+	gapsLostTimeout  atomic.Int64
+	streamsEnded     atomic.Int64
+	missingSeqs      atomic.Int64
+	streamRejects    atomic.Int64
+	heldConflicts    atomic.Int64
+	gapLostRejects   atomic.Int64
 }
 
 // Stats is a point-in-time immutable snapshot of Counters.
@@ -31,6 +44,18 @@ type Stats struct {
 	DroppedBackpressure int64 `json:"dropped_backpressure"`
 	SubscribersLive     int64 `json:"subscribers_live"`
 	Replayed            int64 `json:"replayed"`
+
+	HeldNow          int64 `json:"reorder_held_now"`
+	HeldTotal        int64 `json:"reorder_held_total"`
+	ReleasedFromHold int64 `json:"reorder_released"`
+	GapsFilled       int64 `json:"reorder_gaps_filled"`
+	GapsLostCapacity int64 `json:"reorder_gaps_lost_capacity"`
+	GapsLostTimeout  int64 `json:"reorder_gaps_lost_timeout"`
+	StreamsEnded     int64 `json:"reorder_streams_ended"`
+	MissingSeqs      int64 `json:"reorder_missing_seqs"`
+	StreamRejects    int64 `json:"reorder_stream_rejects"`
+	HeldConflicts    int64 `json:"reorder_held_conflicts"`
+	GapLostRejects   int64 `json:"reorder_gap_lost_rejects"`
 }
 
 func (c *Counters) snapshot() Stats {
@@ -45,5 +70,17 @@ func (c *Counters) snapshot() Stats {
 		DroppedBackpressure: c.droppedBackpressure.Load(),
 		SubscribersLive:     c.subscribersLive.Load(),
 		Replayed:            c.replayed.Load(),
+
+		HeldNow:          c.heldNow.Load(),
+		HeldTotal:        c.heldTotal.Load(),
+		ReleasedFromHold: c.releasedFromHold.Load(),
+		GapsFilled:       c.gapsFilled.Load(),
+		GapsLostCapacity: c.gapsLostCapacity.Load(),
+		GapsLostTimeout:  c.gapsLostTimeout.Load(),
+		StreamsEnded:     c.streamsEnded.Load(),
+		MissingSeqs:      c.missingSeqs.Load(),
+		StreamRejects:    c.streamRejects.Load(),
+		HeldConflicts:    c.heldConflicts.Load(),
+		GapLostRejects:   c.gapLostRejects.Load(),
 	}
 }
